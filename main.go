@@ -2,10 +2,10 @@ package main
 
 import (
 	"bufio"
-	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -42,12 +42,16 @@ func main() {
 		os.Exit(1)
 	}
 }
-
 func runServer(cmd *cobra.Command, args []string) {
-	flag.Parse()
 
-	if playlist == "" {
-		log.Fatal("Please provide a valid path to a playlist file (m3u)")
+	// Convert playlist path to absolute path
+	absPlaylist, err := filepath.Abs(playlist)
+	if err != nil {
+		log.Fatalf("error getting absolute path for playlist: %v", err)
+	}
+
+	if _, err := os.Stat(absPlaylist); os.IsNotExist(err) {
+		log.Fatalf("playlist file %q does not exist", absPlaylist)
 	}
 
 	router := mux.NewRouter()
@@ -117,13 +121,14 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 }
-
 func parseM3u(filename string) ([]string, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
+
+	dir := filepath.Dir(filename)
 
 	scanner := bufio.NewScanner(file)
 	var paths []string
@@ -134,8 +139,13 @@ func parseM3u(filename string) ([]string, error) {
 		}
 
 		path := line
+		path = strings.TrimPrefix(path, "file://")
+		path, err := url.PathUnescape(path)
+		if err != nil {
+			log.Println("error decoding file path: ", err)
+			continue
+		}
 		if !filepath.IsAbs(path) {
-			dir := filepath.Dir(filename)
 			path = filepath.Join(dir, line)
 		}
 
