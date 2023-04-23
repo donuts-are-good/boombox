@@ -3,158 +3,106 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
-
-	"github.com/faiface/beep"
-	"github.com/faiface/beep/mp3"
-	"github.com/faiface/beep/speaker"
-	"github.com/gorilla/mux"
-	"github.com/spf13/cobra"
-)
-
-var (
-	playlist      string
-	port          int
-	listenerCount int
-	listenerMutex sync.Mutex
 )
 
 func main() {
-	rootCmd := &cobra.Command{
-		Use:   "boombox",
-		Short: "audio streaming server for simple minds",
-		Run:   runServer,
-	}
-
-	rootCmd.Flags().StringVar(&playlist, "playlist", "", "Path to the playlist file (m3u)")
-	rootCmd.Flags().IntVar(&port, "port", 42001, "Port on which the server will run")
-
-	if err := rootCmd.Execute(); err != nil {
-		fmt.Println(err)
+	// Get the M3U file path and port number from the command-line arguments.
+	if len(os.Args) != 3 {
+		fmt.Fprintf(os.Stderr, "usage: %s <m3u file> <port>\n", os.Args[0])
 		os.Exit(1)
 	}
-}
-func runServer(cmd *cobra.Command, args []string) {
-
-	// Convert playlist path to absolute path
-	absPlaylist, err := filepath.Abs(playlist)
+	m3uPath := os.Args[1]
+	port, err := strconv.Atoi(os.Args[2])
 	if err != nil {
-		log.Fatalf("error getting absolute path for playlist: %v", err)
+		fmt.Fprintf(os.Stderr, "invalid port number: %s\n", os.Args[2])
+		os.Exit(1)
 	}
 
-	if _, err := os.Stat(absPlaylist); os.IsNotExist(err) {
-		log.Fatalf("playlist file %q does not exist", absPlaylist)
+	// Parse the M3U file to get the audio stream URL.
+	streamURL, err := parseM3u(m3uPath)
+	if err != nil {
+		log.Fatal("failed to parse M3U file: ", err)
 	}
 
-	router := mux.NewRouter()
-	router.HandleFunc("/stream", streamHandler)
+	// Open a TCP listener on the specified port.
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		log.Fatal("failed to open TCP listener: ", err)
+	}
+	defer ln.Close()
 
-	log.Printf("Starting server on port %d\n", port)
-	log.Fatal(http.ListenAndServe(":"+strconv.Itoa(port), router))
-}
-
-func streamHandler(w http.ResponseWriter, r *http.Request) {
-	listenerMutex.Lock()
-	listenerCount++
-	listenerMutex.Unlock()
-
-	defer func() {
-		listenerMutex.Lock()
-		listenerCount--
-		listenerMutex.Unlock()
-	}()
-
-	pathMap := make(map[string]struct{})
-
+	// Accept incoming client connections.
 	for {
-		paths, err := parseM3u(playlist)
+		conn, err := ln.Accept()
 		if err != nil {
-			log.Println("error parsing m3u: ", err)
+			log.Println("failed to accept client connection: ", err)
+			continue
 		}
 
-		for _, path := range paths {
-			if _, ok := pathMap[path]; !ok {
-				pathMap[path] = struct{}{}
+		// Send the Shoutcast response headers.
+		io.WriteString(conn, "ICY 200 OK\r\n")
+		io.WriteString(conn, "Content-Type: audio/mpeg\r\n")
+		io.WriteString(conn, "Cache-Control: no-cache\r\n")
+		io.WriteString(conn, fmt.Sprintf("Content-Length: %d\r\n\r\n", -1))
 
-				listenerMutex.Lock()
-				log.Printf("Listeners connected: %d  Playing track: %s\n", listenerCount, path)
-				listenerMutex.Unlock()
+		// Start streaming the audio data to the client.
+		go func(conn net.Conn) {
+			defer conn.Close()
 
-				f, err := os.Open(path)
-				if err != nil {
-					log.Println("error opening file: ", err)
-					continue
-				}
-
-				streamer, format, err := mp3.Decode(f)
-				if err != nil {
-					log.Println("error decoding file: ", err)
-					f.Close()
-					continue
-				}
-
-				speaker.Init(format.SampleRate, format.SampleRate.N(time.Second/10))
-
-				done := make(chan struct{})
-				speaker.Play(beep.Seq(streamer, beep.Callback(func() {
-					close(done)
-				})))
-
-				select {
-				case <-done:
-					streamer.Close()
-					f.Close()
-				case <-r.Context().Done():
-					streamer.Close()
-					f.Close()
-					return
-				}
+			// Open a new HTTP request to the audio stream URL.
+			resp, err := http.Get(streamURL)
+			if err != nil {
+				log.Println("failed to open audio stream: ", err)
+				return
 			}
-		}
+			defer resp.Body.Close()
+
+			// Copy the audio data from the HTTP response to the client connection.
+			_, err = io.Copy(conn, resp.Body)
+			if err != nil {
+				log.Println("failed to stream audio data: ", err)
+				return
+			}
+		}(conn)
 	}
 }
-func parseM3u(filename string) ([]string, error) {
+
+func parseM3u(filename string) (string, error) {
 	file, err := os.Open(filename)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	defer file.Close()
 
-	dir := filepath.Dir(filename)
-
 	scanner := bufio.NewScanner(file)
-	var paths []string
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if strings.HasPrefix(line, "#") || line == "" {
 			continue
 		}
 
-		path := line
-		path = strings.TrimPrefix(path, "file://")
-		path, err := url.PathUnescape(path)
+		line = strings.TrimPrefix(line, "file://")
+		u, err := url.Parse(line)
+
 		if err != nil {
-			log.Println("error decoding file path: ", err)
+			log.Println("error parsing audio stream URL: ", err)
 			continue
 		}
-		if !filepath.IsAbs(path) {
-			path = filepath.Join(dir, line)
-		}
 
-		paths = append(paths, path)
+		return u.String(), nil
 	}
 
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		return "", err
 	}
 
-	return paths, nil
+	return "", fmt.Errorf("no audio stream URL found in M3U file")
 }
