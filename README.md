@@ -3,8 +3,10 @@
 #boombox
 
 ## what?
+it's a streaming audio server like shoutcast, it's just broken right now. idk im stuck. 
 
 ## usage
+ill type up more later for this section
 
 ## license
 MIT License 2023 donuts-are-good https://github.com/donuts-are-good
