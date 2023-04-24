@@ -4,105 +4,147 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
-	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
-func main() {
-	// Get the M3U file path and port number from the command-line arguments.
-	if len(os.Args) != 3 {
-		fmt.Fprintf(os.Stderr, "usage: %s <m3u file> <port>\n", os.Args[0])
-		os.Exit(1)
-	}
-	m3uPath := os.Args[1]
-	port, err := strconv.Atoi(os.Args[2])
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid port number: %s\n", os.Args[2])
-		os.Exit(1)
-	}
-
-	// Parse the M3U file to get the audio stream URL.
-	streamURL, err := parseM3u(m3uPath)
-	if err != nil {
-		log.Fatal("failed to parse M3U file: ", err)
-	}
-
-	// Open a TCP listener on the specified port.
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-	if err != nil {
-		log.Fatal("failed to open TCP listener: ", err)
-	}
-	defer ln.Close()
-
-	// Accept incoming client connections.
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			log.Println("failed to accept client connection: ", err)
-			continue
-		}
-
-		// Send the Shoutcast response headers.
-		io.WriteString(conn, "ICY 200 OK\r\n")
-		io.WriteString(conn, "Content-Type: audio/mpeg\r\n")
-		io.WriteString(conn, "Cache-Control: no-cache\r\n")
-		io.WriteString(conn, fmt.Sprintf("Content-Length: %d\r\n\r\n", -1))
-
-		// Start streaming the audio data to the client.
-		go func(conn net.Conn) {
-			defer conn.Close()
-
-			// Open a new HTTP request to the audio stream URL.
-			resp, err := http.Get(streamURL)
-			if err != nil {
-				log.Println("failed to open audio stream: ", err)
-				return
-			}
-			defer resp.Body.Close()
-
-			// Copy the audio data from the HTTP response to the client connection.
-			_, err = io.Copy(conn, resp.Body)
-			if err != nil {
-				log.Println("failed to stream audio data: ", err)
-				return
-			}
-		}(conn)
-	}
+type StreamWriter struct {
+	sync.RWMutex
+	clients map[chan []byte]bool
 }
 
-func parseM3u(filename string) (string, error) {
-	file, err := os.Open(filename)
+type ChanReader struct {
+	ch chan []byte
+}
+
+func main() {
+	if len(os.Args) < 3 {
+		fmt.Println("Usage: go run main.go <IP:Port> <PlaylistFile>")
+		return
+	}
+
+	addr := os.Args[1]
+	playlistFile := os.Args[2]
+
+	file, err := os.Open(playlistFile)
 	if err != nil {
-		return "", err
+		fmt.Println("error opening playlist file:", err)
+		return
 	}
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
+	var playlist []string
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "#") || line == "" {
-			continue
-		}
-
-		line = strings.TrimPrefix(line, "file://")
-		u, err := url.Parse(line)
-
-		if err != nil {
-			log.Println("error parsing audio stream URL: ", err)
-			continue
-		}
-
-		return u.String(), nil
+		playlist = append(playlist, strings.TrimSpace(scanner.Text()))
 	}
 
 	if err := scanner.Err(); err != nil {
-		return "", err
+		fmt.Println("error reading playlist file:", err)
+		return
 	}
 
-	return "", fmt.Errorf("no audio stream URL found in M3U file")
+	stream := NewStreamWriter()
+	go streamPlaylist(stream, playlist)
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		clientChan := stream.AddClient()
+		defer stream.RemoveClient(clientChan)
+
+		w.Header().Set("Content-Type", "audio/mpeg")
+		io.Copy(w, &ChanReader{ch: clientChan})
+	})
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		fmt.Println("error starting server:", err)
+		return
+	}
+	fmt.Printf("%s started at %s\n", playlistFile, addr)
+
+	http.Serve(ln, nil)
+}
+
+func (sw *StreamWriter) Write(p []byte) (n int, err error) {
+	sw.RLock()
+	defer sw.RUnlock()
+
+	for client := range sw.clients {
+		select {
+		case client <- p:
+		default:
+		}
+	}
+
+	return len(p), nil
+}
+
+func (sw *StreamWriter) AddClient() chan []byte {
+	sw.Lock()
+	defer sw.Unlock()
+
+	client := make(chan []byte, 100)
+	sw.clients[client] = true
+	return client
+}
+
+func (sw *StreamWriter) RemoveClient(client chan []byte) {
+	sw.Lock()
+	defer sw.Unlock()
+
+	delete(sw.clients, client)
+	close(client)
+}
+
+func NewStreamWriter() *StreamWriter {
+	return &StreamWriter{
+		clients: make(map[chan []byte]bool),
+	}
+}
+
+func (r *ChanReader) Read(p []byte) (n int, err error) {
+	data, ok := <-r.ch
+	if !ok {
+		return 0, io.EOF
+	}
+	return copy(p, data), nil
+}
+
+func streamPlaylist(sw *StreamWriter, playlist []string) {
+	bufSize := 8192
+	buffer := make([]byte, bufSize)
+	ticker := time.NewTicker(20 * time.Millisecond)
+
+	for {
+		for _, file := range playlist {
+			fmt.Printf("%d:%d now playing: %s\n", time.Now().Hour(), time.Now().Minute(), file)
+
+			audioFile, err := os.Open(file)
+			if err != nil {
+				fmt.Println("error opening audio file:", err)
+				continue
+			}
+
+			for {
+				<-ticker.C
+				n, err := audioFile.Read(buffer)
+				if err != nil && err != io.EOF {
+					fmt.Println("error reading audio file:", err)
+					break
+				}
+
+				if n == 0 {
+					break
+				}
+
+				sw.Write(buffer[:n])
+			}
+
+			audioFile.Close()
+		}
+	}
 }
